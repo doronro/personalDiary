@@ -1,0 +1,136 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Attest — compliance PR gate  (advisory by default · per-PR blocking via label)
+# Frameworks: SOC 2 (Security / Common Criteria)
+# Project: Personal Diary
+# Trigger: every pull request (opened / updated / reopened) + a baseline scan on every push to main/master.
+#
+# Drop this file into .github/workflows/ and commit it to your default branch.
+# Each framework posts its own PR comment.
+#
+# BASELINE: the gate scans your base branch on each push to main/master, so a PR
+# can show ONLY what it changed (fixed / newly introduced) — not your whole backlog.
+# If your default branch isn't main or master, edit the "push: branches" list below.
+#
+# BLOCKING (optional, decided per run): add the 'attest-block' label to a pull
+# request and this check FAILS whenever the scan finds issues introduced by the PR.
+# The label is read fresh on every run, so each run is its own decision: remove the
+# label and the next run of the same result passes as advisory again. Toggling the
+# label re-runs the check automatically, and a commit that was already scanned
+# returns its stored result instantly (no re-scan). If the scan itself cannot start
+# or finish, the check never fails — blocking applies only to a completed verdict.
+# NOTE: a failing check prevents merging only if you also mark this check as
+# required in the branch protection rules (repo Settings → Branches).
+#
+# SECURITY: this file does NOT contain your Attest gate token — it references a GitHub
+# Actions secret instead (this repository is public, or its visibility could not be
+# confirmed). Before your first run, create an Actions secret named ATTEST_TOKEN
+# (repo Settings → Secrets and variables → Actions → New repository secret) with your
+# gate token — copy it from the Attest PR Gate page.
+# ────────────────────────────────────────────────────────────────────────────
+name: Attest compliance check
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main, master]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  attest:
+    if: github.event_name == 'push' || (github.event.action != 'labeled' && github.event.action != 'unlabeled') || github.event.label.name == 'attest-block'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # One framework at a time: each scan is a full repo read, so serializing keeps them
+      # from starving each other. Raise this once the backend has more headroom.
+      max-parallel: 1
+      matrix:
+        framework: [soc2]
+    steps:
+      - name: Run Attest compliance gate
+        env:
+          ATTEST_TOKEN: "${{ secrets.ATTEST_TOKEN }}"
+          ATTEST_API: "https://agentsincorporated.ai/api"
+          FRAMEWORK: ${{ matrix.framework }}
+          PROJECT_ID: "b9eeb350-655b-44b8-b080-e3c917d746d7"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Baseline pass: on a push to the base branch (a merge), scan it so future PRs have a
+          # reference to diff against. There's no PR here — just record the baseline, no comment.
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "Attest: baseline scan for $GITHUB_REF_NAME ($FRAMEWORK)…"
+            curl -sS -X POST "$ATTEST_API/gate/scan" \
+              -H "X-Attest-Token: $ATTEST_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"framework\":\"$FRAMEWORK\",\"projectId\":\"$PROJECT_ID\",\"headRef\":\"$GITHUB_REF_NAME\",\"headSha\":\"$GITHUB_SHA\",\"baseRef\":\"$GITHUB_REF_NAME\"}" >/dev/null \
+              && echo "Attest: baseline scan started for $GITHUB_REF_NAME (no PR comment)."
+            exit 0
+          fi
+          PR="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          REPO="${{ github.repository }}"
+
+          # Per-run blocking decision: the 'attest-block' label, read fresh from the PR on every
+          # run. Any error reading labels fails open to advisory.
+          BLOCK_LABEL="attest-block"
+          BLOCKING=false
+          PR_LABELS=$(gh api "repos/$REPO/issues/$PR/labels" --paginate --jq '.[].name' 2>/dev/null || true)
+          if printf '%s\n' "$PR_LABELS" | grep -xF "$BLOCK_LABEL" >/dev/null; then
+            BLOCKING=true
+          fi
+          if [ "$BLOCKING" = "true" ]; then
+            echo "Attest: BLOCKING run — label '$BLOCK_LABEL' is set; new issues will fail this check."
+          else
+            echo "Attest: advisory run — add the '$BLOCK_LABEL' label to make findings fail this check."
+          fi
+
+          echo "Attest: starting scan for PR #$PR ($FRAMEWORK)…"
+          START=$(curl -sS -X POST "$ATTEST_API/gate/scan" \
+            -H "X-Attest-Token: $ATTEST_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"framework\":\"$FRAMEWORK\",\"projectId\":\"$PROJECT_ID\",\"headRef\":\"$HEAD_REF\",\"headSha\":\"$HEAD_SHA\",\"baseRef\":\"$BASE_REF\",\"prNumber\":$PR}")
+          SCAN_ID=$(echo "$START" | jq -r '.scanId // empty')
+          if [ -z "$SCAN_ID" ]; then echo "Attest: could not start scan (non-blocking): $START"; exit 0; fi
+
+          echo "Attest: scan $SCAN_ID running; waiting for results…"
+          RES=""; STATUS=""
+          for i in $(seq 1 138); do   # ~23 min, covers the 20-min server-side AI ceiling
+            sleep 10
+            RES=$(curl -sS "$ATTEST_API/gate/scan/$SCAN_ID?blocking=$BLOCKING" -H "X-Attest-Token: $ATTEST_TOKEN")
+            [ "$(echo "$RES" | jq -r '.completed // false')" = "true" ] && break
+            STATUS=$(echo "$RES" | jq -r '.status // ""')
+            case "$STATUS" in Failed|Cancelled|Stopped) break;; esac
+          done
+
+          BODY=$(echo "$RES" | jq -r '.commentMarkdown // empty')
+          if [ -z "$BODY" ]; then
+            ERR=$(echo "$RES" | jq -r '.error // "The scan did not finish in time."')
+            echo "Attest: scan did not complete — $ERR"
+            BODY=$(printf '## 🛡️ Attest — %s compliance check\n\n> ⚠️ The scan could not complete: %s\n\n<sub>Advisory · Attest · this comment updates on the next run.</sub>\n<!-- attest-gate:%s -->' "$FRAMEWORK" "$ERR" "$FRAMEWORK")
+          fi
+
+          MARKER="<!-- attest-gate:$FRAMEWORK -->"
+          printf '%s' "$BODY" > /tmp/attest-comment.md
+          EXISTING=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body | contains(\"$MARKER\"))) | .[0].id // empty" 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -F body=@/tmp/attest-comment.md >/dev/null \
+              && echo "Attest: updated existing comment."
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@/tmp/attest-comment.md >/dev/null \
+              && echo "Attest: posted comment."
+          fi
+
+          # Blocking applies only to a completed scan's verdict — a scan that failed to start or
+          # finish never fails the check, even on a blocking run (fail open, never on our outage).
+          VERDICT=$(echo "$RES" | jq -r '.verdict // empty')
+          if [ "$BLOCKING" = "true" ] && [ "$VERDICT" = "warning" ]; then
+            echo "Attest: this change introduced issues and the '$BLOCK_LABEL' label is set — failing the check."
+            echo "Attest: fix the findings, or remove the label to let the next run pass as advisory."
+            exit 1
+          fi
+          echo "Attest: gate complete."
